@@ -1,0 +1,75 @@
+
+#!/bin/bash
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+export PATH="$PWD/backend/.venv/bin:$PATH"
+# OpenShorts YouTube Publisher backend-only credentials
+if [ -f backend/.youtube.env ]; then
+  set -a
+  . backend/.youtube.env
+  set +a
+fi
+
+# Check FFmpeg
+if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+    echo "FFmpeg missing. Install: brew install ffmpeg"
+    exit 1
+fi
+
+# Create Python virtual environment
+if [ ! -d backend/.venv ]; then
+    python3 -m venv backend/.venv
+fi
+
+# Make installed Python tools discoverable
+export PATH="$PWD/backend/.venv/bin:$PATH"
+
+# Install backend dependencies
+python -m pip install -q -r backend/requirements.txt
+
+# Install video download and transcription tools
+python -m pip install -q yt-dlp faster-whisper
+
+# Verify the installations
+python -c "import yt_dlp; from faster_whisper import WhisperModel; print('AI dependencies ready')"
+
+# Install frontend dependencies
+if [ ! -d frontend/node_modules ]; then
+    (cd frontend && npm install)
+fi
+
+# Create frontend environment file
+if [ ! -f frontend/.env.local ]; then
+    cp frontend/.env.example frontend/.env.local
+fi
+
+mkdir -p data
+
+# Stop both servers when script exits
+cleanup() {
+    kill "${BACK_PID:-}" "${FRONT_PID:-}" 2>/dev/null || true
+}
+
+trap cleanup EXIT INT TERM
+
+# Start backend
+(
+    cd backend
+    python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+) &
+BACK_PID=$!
+
+# Start frontend
+(
+    cd frontend
+    npm run dev
+) &
+FRONT_PID=$!
+
+echo "OpenShorts: http://localhost:3000"
+echo "API: http://localhost:8000/docs"
+
+wait
+
