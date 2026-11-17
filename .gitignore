@@ -17,3 +17,5 @@ data/
 
 # Private local YouTube API key / creator-provided media source
 /backend/.channel-monitor.env
+
+/frontend/.next-dev/
