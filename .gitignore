@@ -24,3 +24,5 @@ data/
 *.bak
 *.before-*
 *backup-*
+
+/*-backup-*/
