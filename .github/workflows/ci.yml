@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      OPENSHORTS_DATA: ${{ runner.temp }}/openshorts-ci-data
+      OPENSHORTS_DATA: /tmp/openshorts-ci-data
       OPENSHORTS_LIVE_RECORDING_ENABLED: '0'
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
