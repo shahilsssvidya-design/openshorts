@@ -20,3 +20,7 @@ data/
 
 /frontend/.next-dev/
 /frontend/.next-dev/
+
+*.bak
+*.before-*
+*backup-*
