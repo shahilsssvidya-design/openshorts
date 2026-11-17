@@ -10,3 +10,6 @@ yt-dlp>=2025.1
 # Encrypted local YouTube OAuth token storage
 cryptography>=43,<48
 Pillow>=10,<13
+
+faster-whisper==1.2.1
+av==18.1.0
