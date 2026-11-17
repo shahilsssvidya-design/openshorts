@@ -1,0 +1,75 @@
+name: OpenShorts CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openshorts-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests / Python 3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENSHORTS_DATA: ${{ runner.temp }}/openshorts-ci-data
+      OPENSHORTS_LIVE_RECORDING_ENABLED: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install FFmpeg and FFprobe
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -n 1
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          python -m pip check
+      - name: Check Python syntax
+        run: python -m compileall -q backend/app backend/tests
+      - name: Run offline API and video-export tests
+        working-directory: backend
+        run: python -m pytest -q tests
+
+  frontend:
+    name: Frontend typecheck and build / Node 22
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install frontend dependencies
+        working-directory: frontend
+        shell: bash
+        run: |
+          if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+      - name: Check TypeScript
+        working-directory: frontend
+        run: npm run lint
+      - name: Build Next.js production app
+        working-directory: frontend
+        run: npm run build

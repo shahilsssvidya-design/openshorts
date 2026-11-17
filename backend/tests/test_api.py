@@ -22,10 +22,22 @@ def test_auth_rejection():
     assert client.get('/api/projects').status_code==401
     assert client.post('/api/auth/signup',json={'email':'bad','password':'abc'}).status_code==422
 def test_transcript_and_ranking():
-    subs=parse_srt('1\n00:00:01,000 --> 00:00:03,000\nHello world\n\n2\n00:00:03,000 --> 00:00:06,000\nThe secret is here')
-    assert len(subs)==2
-    clips=rank_clips(subs,60)
-    assert clips and clips[0]['end']>clips[0]['start']
+    # Use a realistic stretch of dialogue: current clip ranking requires a
+    # substantial amount of speech, not just two short subtitle fragments.
+    srt = (
+        '1\n00:00:00,000 --> 00:00:12,000\n'
+        'Why does this problem happen and how can we solve it together today?\n\n'
+        '2\n00:00:12,000 --> 00:00:24,000\n'
+        'First we learn the simplest trick and understand the mistake everyone makes.\n\n'
+        '3\n00:00:24,000 --> 00:00:36,000\n'
+        'Finally the result is surprising because the solution works even better now.\n'
+    )
+    subs = parse_srt(srt)
+    assert len(subs) == 3
+    clips = rank_clips(subs, 40)
+    assert clips and clips[0]['end'] > clips[0]['start']
+    assert clips[0]['end'] <= 40
+
 def test_upload_analyze_export():
     h=auth();pid=client.post('/api/projects',headers=h,json={'title':'Video test'}).json()['id']
     tmp=tempfile.NamedTemporaryFile(suffix='.mp4',delete=False);tmp.close()
