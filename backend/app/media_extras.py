@@ -149,7 +149,7 @@ def _ass_arg(path: Path) -> str:
     return f"ass=filename='{escaped}'"
 
 def render_split(source: Path, start: float, end: float, clip: dict, subtitle: Optional[Path], dest: Path, pid: str):
-    """1080×1920: full source image in the upper half; looped muted gameplay below."""
+    """1080×1920: center-cropped full-bleed main above muted full-bleed gameplay."""
     kind = clip.get('gameplay_kind', 'minecraft')
     game = gameplay_path(pid, kind)
     if not game:
@@ -158,8 +158,8 @@ def render_split(source: Path, start: float, end: float, clip: dict, subtitle: O
         raise ValueError('Clip end must be after start')
     duration = float(end - start)
     graph = (
-        '[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=decrease:flags=lanczos,'
-        'pad=1080:960:(ow-iw)/2:(oh-ih)/2:color=0x14121d,setsar=1,format=yuv420p[top];'
+        '[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase:flags=lanczos,'
+        'crop=1080:960,setsar=1,format=yuv420p[top];'
         '[1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase:flags=lanczos,'
         'crop=1080:960,setsar=1,format=yuv420p[bottom];'
         '[top][bottom]vstack=inputs=2,format=yuv420p'
@@ -235,6 +235,10 @@ def project_archive(pid: str, u=Depends(auth)):
             for path in (folder/'gameplay').glob('*') if (folder/'gameplay').is_dir() else []:
                 if path.is_file() and path.suffix in ALLOWED:
                     archive.write(path, folder_name+'/gameplay/'+path.name)
+            # AI Content Studio: include only generated creative assets (no secrets/tokens).
+            for asset in (folder/'creative').rglob('*') if (folder/'creative').is_dir() else []:
+                if asset.is_file() and asset.suffix.lower() in ('.jpg', '.json'):
+                    archive.write(asset, folder_name+'/'+str(asset.relative_to(folder)))
             # Include only actual clip stills (create lazily if not requested by UI).
             if row.get('media_path') and Path(row['media_path']).is_file():
                 source = Path(row['media_path'])

@@ -575,3 +575,14 @@ import sys as _os_sys
 from app import media_extras
 media_extras.init(_os_sys.modules[__name__])
 app.include_router(media_extras.router)
+
+# OpenShorts AI Content Studio — grounded Ollama packaging + real-frame thumbnails.
+import sys as _os_creative_sys
+from app import creative_ai
+creative_ai.init(_os_creative_sys.modules[__name__])
+app.include_router(creative_ai.router)
+
+# OpenShorts AI Metadata Fix: optional project-wide Qwen enrichment.
+from app import ai_metadata as _os_ai_metadata
+_os_ai_metadata.init(__import__(__name__, fromlist=['app']))
+app.include_router(_os_ai_metadata.router)

@@ -70,6 +70,7 @@ export function YouTubePublisher({exportId,clipTitle,clipDescription=''}:{export
     return()=>window.clearInterval(id);
   },[status?.id,status?.status]);
   async function show(){
+    setTitle(clipTitle.slice(0,100));setDescription(clipDescription.slice(0,5000));
     setOpen(true);setError('');
     try{setConnection(await request<Connection>('/youtube/status'))}
     catch(e){setError((e as Error).message)}
