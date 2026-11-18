@@ -239,6 +239,12 @@ def project_archive(pid: str, u=Depends(auth)):
             for asset in (folder/'creative').rglob('*') if (folder/'creative').is_dir() else []:
                 if asset.is_file() and asset.suffix.lower() in ('.jpg', '.json'):
                     archive.write(asset, folder_name+'/'+str(asset.relative_to(folder)))
+            # Save original user-supplied music inside the full project archive.
+            audio_folder=folder/'music'
+            if audio_folder.is_dir():
+                for audio in audio_folder.iterdir():
+                    if audio.is_file() and (audio.name=='name.json' or audio.stem=='custom' and audio.suffix.lower() in ('.mp3','.wav','.m4a','.aac','.flac','.ogg','.opus','.wma')):
+                        archive.write(audio,folder_name+'/music/'+audio.name)
             # Include only actual clip stills (create lazily if not requested by UI).
             if row.get('media_path') and Path(row['media_path']).is_file():
                 source = Path(row['media_path'])

@@ -98,3 +98,35 @@
 .os-batch-ai-controls select{border:1px solid #494052;color:#eee;background:#24212c;border-radius:9px;padding:8px 10px;max-width:160px;font-size:12px}
 .os-batch-ai .hint{font-size:12px;color:#aea3bc;line-height:1.4}
 .os-batch-ai .form-error{font-size:12px;display:inline-flex}
+
+/* OpenShorts smarter moments reason and source badges */
+.moment-reason{font-size:12px;line-height:1.4;opacity:.78;margin-top:5px;}
+.moment-score small{font-size:10px;font-weight:700;letter-spacing:.03em;margin-left:5px;opacity:.88;}
+
+/* OpenShorts Background Music — matches existing dark editor */
+.os-music-panel{display:flex;flex-direction:column;gap:18px}
+.os-music-header{display:flex;align-items:flex-start;gap:14px;border:1px solid rgba(160,132,255,.24);background:rgba(139,95,243,.08);padding:16px;border-radius:13px}
+.os-music-header>svg{color:#aa89ff;flex-shrink:0}
+.os-music-header strong{font-size:16px;color:#f3edff}
+.os-music-header p{margin:5px 0 0;color:#a9a2b8;font-size:13px;line-height:1.5}
+.os-music-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.os-music-choice{position:relative;text-align:left;display:flex;flex-direction:column;gap:7px;border:1px solid #393240;border-radius:12px;padding:13px 14px;min-height:100px;background:#191620;color:#f6f1ff;cursor:pointer}
+.os-music-choice:hover:not(:disabled){border-color:#9970f8;background:#221b2d}
+.os-music-choice.chosen{border-color:#a77aff;background:rgba(132,86,227,.17);box-shadow:inset 0 0 0 1px rgba(167,122,255,.1)}
+.os-music-choice:disabled{opacity:.5;cursor:not-allowed}
+.os-music-choice strong{font-size:13px;padding-right:14px}
+.os-music-choice small{font-size:12px;color:#b7b0c4;line-height:1.35;overflow-wrap:anywhere}
+.os-music-choice em{font-size:10px;font-style:normal;color:#988ca9}
+.os-music-choice svg{position:absolute;right:10px;top:11px;color:#bb99ff}
+.os-music-listen{border-radius:12px;border:1px solid rgba(153,135,171,.18);padding:12px;background:#17151c}
+.os-music-listen label{display:block;font-size:11px;margin-bottom:9px;color:#b9b0ca;letter-spacing:.08em}
+.os-music-listen audio{width:100%;height:42px}
+.os-music-listen .hint{margin:8px 0 0}
+.os-music-panel .control-group>label{display:flex;align-items:center;gap:7px;justify-content:flex-start}
+.os-music-panel .control-group>label span{margin-left:auto}
+.os-music-panel input[type="range"]{width:100%;accent-color:#976ef2}
+.os-music-notice{display:flex;gap:7px;color:#bcebd5;font-size:12px}
+@media(max-width:620px){.os-music-grid{grid-template-columns:1fr}}
+/* Five tabs now fit smaller screens without crushing labels. */
+.editor-tabs{overflow-x:auto;scrollbar-width:thin}
+

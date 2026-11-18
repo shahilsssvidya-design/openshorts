@@ -120,6 +120,9 @@ class ClipEdit(BaseModel):
     bottom_color_b:str='#4B2F85'
     focus_mode:str='auto'
     caption_language:str='original'
+    music_track:str='none'
+    music_volume:float=Field(default=0.20,ge=0,le=1)
+    original_volume:float=Field(default=1.0,ge=0,le=1)
 class SettingsPayload(BaseModel):
     title:Optional[str]=None
 
@@ -388,7 +391,11 @@ def analyze_job(pid):
         with connection() as c: row=c.execute('SELECT media_path,duration FROM projects WHERE id=?',(pid,)).fetchone()
         transcript=ensure_transcript(pid,row['media_path'])
         update(pid,progress=74)
-        clips=rank_clips(transcript,float(row['duration']))
+        from .moment_intelligence import choose_moments
+        clips=choose_moments(transcript,float(row['duration']),fallback_ranker=rank_clips,
+                             progress=lambda value: update(pid,progress=value))
+        for clip in clips:
+            clip['id']=uid()[:12]
         if not clips: raise RuntimeError('No usable speech segments for clips')
         update(pid,clips=json.dumps(clips),status='ready',progress=100,error=None)
     except Exception as e: update(pid,status='failed',error=str(e)[:650],progress=0)
@@ -407,6 +414,8 @@ def edit_clip(pid:str,clip_id:str,data:ClipEdit,u=Depends(current_user)):
     if not re.fullmatch(r'#[a-fA-F0-9]{6}',data.color): raise HTTPException(422,'Invalid hex color')
     from .fit_layout import validate_style
     try: validate_style(data.model_dump())
+    except ValueError as exc: raise HTTPException(422,str(exc))
+    try: os_music.validate_settings(data.music_track, data.music_volume, data.original_volume)
     except ValueError as exc: raise HTTPException(422,str(exc))
     item.update(data.model_dump()); update(pid,clips=json.dumps(clips))
     return item
@@ -502,6 +511,7 @@ def render_job(pid,user_id,clip,export_id):
             dest=media_extras.title_export_path(pid,clip,export_id)
             update(pid, progress=45)
             media_extras.render_split(path,start,end,clip,ass,dest,pid)
+            os_music.apply_music_to_export(pid,clip,dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
@@ -512,6 +522,7 @@ def render_job(pid,user_id,clip,export_id):
             dest=media_extras.title_export_path(pid,clip,export_id)
             update(pid,progress=45)
             render_fit(path,start,end,clip,ass,dest,row['width'],row['height'])
+            os_music.apply_music_to_export(pid,clip,dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
@@ -527,6 +538,7 @@ def render_job(pid,user_id,clip,export_id):
         update(pid,progress=45)
         run('ffmpeg','-hide_banner','-loglevel','error','-y','-ss',start,'-i',path,'-t',end-start,'-vf',vf,'-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p','-c:a','aac','-b:a','160k','-movflags','+faststart',dest,timeout=1800)
         if not dest.exists() or dest.stat().st_size<1000: raise RuntimeError('MP4 render did not produce a usable file')
+        os_music.apply_music_to_export(pid,clip,dest)
         with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
         update(pid,status='ready',progress=100,error=None)
     except Exception as exc: update(pid,status='failed',progress=0,error=str(exc)[:650])
@@ -586,3 +598,9 @@ app.include_router(creative_ai.router)
 from app import ai_metadata as _os_ai_metadata
 _os_ai_metadata.init(__import__(__name__, fromlist=['app']))
 app.include_router(_os_ai_metadata.router)
+
+# OpenShorts Background Music Upgrade — authenticated library + original demos.
+import sys as _os_music_sys
+from app import music as os_music
+os_music.init(_os_music_sys.modules[__name__])
+app.include_router(os_music.router)

@@ -420,3 +420,13 @@ If something breaks, open a GitHub Issue with:
 OpenShorts is intended for media you own or have permission to use. Please respect copyrights and the rules of YouTube and other platforms.
 
 **Made for creators who want to build better Shorts, one clip at a time.**
+
+## Background Music (OpenShorts)
+
+Open a project, choose a clip, and click the **Music** tab. You can choose an
+original included demo (**Night Drive**, **Bright Bounce**, or **Soft Focus**),
+or upload an MP3/WAV/M4A/FLAC/OGG file you have permission to use.
+Adjust **Music Volume** (try 20%) and **Original Video Volume** (try 100%),
+then click **Save changes** and **Export MP4**. Music automatically loops
+and fades out at the end. This works with Smart Crop, Fit / No Crop, and
+Gameplay Split Screen. See [the full Music guide](docs/BACKGROUND_MUSIC.md).
