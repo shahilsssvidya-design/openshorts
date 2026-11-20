@@ -609,7 +609,16 @@ def source(pid:str,u=Depends(current_user)):
 def exports(pid:str,u=Depends(current_user)):
     get_project(pid,u['id'])
     with connection() as c: rows=c.execute('SELECT id,clip_id,created_at FROM exports WHERE project_id=? AND user_id=? ORDER BY created_at DESC',(pid,u['id'])).fetchall()
-    return [dict(r) for r in rows]
+    result=[]
+    for record in rows:
+        entry=dict(record)
+        with connection() as c: stored=c.execute('SELECT path FROM exports WHERE id=? AND user_id=?',(entry['id'],u['id'])).fetchone()
+        report=Path(str(stored['path'])+'.quality.json') if stored else None
+        if report and report.is_file():
+            try: entry['quality']=json.loads(report.read_text(encoding='utf-8'))
+            except (ValueError,OSError): entry['quality']=None
+        result.append(entry)
+    return result
 @app.get('/api/exports/{eid}/download')
 def download(eid:str,u=Depends(current_user)):
     with connection() as c: row=c.execute('SELECT * FROM exports WHERE id=? AND user_id=?',(eid,u['id'])).fetchone()
