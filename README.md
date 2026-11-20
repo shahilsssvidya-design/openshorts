@@ -430,3 +430,10 @@ Adjust **Music Volume** (try 20%) and **Original Video Volume** (try 100%),
 then click **Save changes** and **Export MP4**. Music automatically loops
 and fades out at the end. This works with Smart Crop, Fit / No Crop, and
 Gameplay Split Screen. See [the full Music guide](docs/BACKGROUND_MUSIC.md).
+
+### Use chat to find highlights
+
+- In a project with a source video, import an authorized YouTube chat replay JSONL file under **Source video**. A normalized JSONL file also works, with one object per line containing `id`, `author_id`, `text`, and `offset_seconds` (seconds on the replay timeline).
+- Set **Recording start in chat timeline** to the point at which the local recording begins. Use 0 for a full replay. Select **Discover best moments** or **Re-analyze video**. The detector looks for bursts across distinct viewers and uses chat to boost speech windows with audible audio and nonblack video. Only aggregate burst data is stored.
+- For automatic chat on **Live Highlights**, set `OPENSHORTS_YOUTUBE_API_KEY` and `OPENSHORTS_LIVE_CHAT_CAPTURE_DELAY_SECONDS` in `backend/.channel-monitor.env` and start with `bash scripts/start-mac.sh`. The delay is the measured number of seconds the first captured frame trails the wall clock at capture launch. Calibrate it with an on-stream clock or known event. Live alignment is approximate and can drift when delivery latency changes. Replay offsets are preferable for precise alignment. Chat access depends on the broadcast and the API key's permissions and quota.
+- Live Highlights can export a local draft. Open it, review the MP4, and use **Publish to YouTube** for a manual upload. After a failed or ambiguous upload, confirm in YouTube Studio that the video is absent and uploads are available before retrying. If YouTube Studio shows a video, use the existing upload.

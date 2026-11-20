@@ -55,6 +55,8 @@ export function YouTubePublisher({exportId,clipTitle,clipDescription=''}:{export
   const [privacy,setPrivacy]=useState<'private'|'unlisted'|'public'>('private');
   const [madeForKids,setMadeForKids]=useState<'unknown'|'yes'|'no'>('unknown');
   const [rights,setRights]=useState(false);
+  const [reviewed,setReviewed]=useState(false);
+  const [studioChecked,setStudioChecked]=useState(false);
   const [status,setStatus]=useState<UploadRecord|null>(null);
   const [error,setError]=useState('');
   const [busy,setBusy]=useState(false);
@@ -71,7 +73,7 @@ export function YouTubePublisher({exportId,clipTitle,clipDescription=''}:{export
   },[status?.id,status?.status]);
   async function show(){
     setTitle(clipTitle.slice(0,100));setDescription(clipDescription.slice(0,5000));
-    setOpen(true);setError('');
+    setOpen(true);setError('');setReviewed(false);setStudioChecked(false);
     try{setConnection(await request<Connection>('/youtube/status'))}
     catch(e){setError((e as Error).message)}
   }
@@ -83,7 +85,7 @@ export function YouTubePublisher({exportId,clipTitle,clipDescription=''}:{export
     try{
       const result=await post<UploadRecord>('/youtube/uploads',{
         export_id:exportId,title:title.trim(),description,privacy,
-        made_for_kids:madeForKids==='yes',rights_confirmed:rights
+        made_for_kids:madeForKids==='yes',rights_confirmed:rights,clip_reviewed:reviewed,studio_retry_confirmed:studioChecked
       });
       setStatus(result);
     }catch(e){setError((e as Error).message)}finally{setBusy(false)}
@@ -130,9 +132,14 @@ export function YouTubePublisher({exportId,clipTitle,clipDescription=''}:{export
           </div>
           <label className="yt-rights"><input type="checkbox" checked={rights} onChange={e=>setRights(e.target.checked)}/>
             <span>I own this content or have permission to publish it on YouTube.</span></label>
+          <label className="yt-rights"><input type="checkbox" checked={reviewed} onChange={e=>setReviewed(e.target.checked)}/>
+            <span>I reviewed this exported clip.</span></label>
+          {(status?.status==='failed'||error.includes('Check YouTube Studio for an existing video'))&&
+            <label className="yt-rights"><input type="checkbox" checked={studioChecked} onChange={e=>setStudioChecked(e.target.checked)}/>
+              <span>I checked YouTube Studio, confirmed this video is absent, and verified uploads are available.</span></label>}
           <p className="hint">Uploads only after you press Publish. Start with Private when testing. YouTube determines Shorts eligibility after upload.</p>
           {error&&<p role="alert" className="yt-error">{error}</p>}
-          <button className="btn btn-primary yt-submit" disabled={busy||!connection?.connected||!rights||madeForKids==='unknown'||!title.trim()} onClick={publish}>
+          <button className="btn btn-primary yt-submit" disabled={busy||!connection?.connected||!rights||!reviewed||(status?.status==='failed'&&!studioChecked)||madeForKids==='unknown'||!title.trim()} onClick={publish}>
             {busy?'Starting upload…':privacy==='public'?'Publish publicly':'Upload as '+privacy}
           </button>
         </>}

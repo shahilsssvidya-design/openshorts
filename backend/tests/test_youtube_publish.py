@@ -66,7 +66,7 @@ def test_publish_ownership_validation_and_no_accidental_public(client,monkeypatc
         db.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',('test-export-id', 'project-test',uid1,'clip-test',str(path),app_main.now()))
     yp._save_creds(uid1,{'access_token':'x','refresh_token':'y','expires_at':int(time.time())+3600})
     yp._save_creds(uid2,{'access_token':'x','refresh_token':'y','expires_at':int(time.time())+3600})
-    payload={'export_id':'test-export-id','title':'A short','description':'', 'privacy':'private','made_for_kids':False,'rights_confirmed':True}
+    payload={'export_id':'test-export-id','title':'A short','description':'', 'privacy':'private','made_for_kids':False,'rights_confirmed':True,'clip_reviewed':True}
     forbidden=client.post('/api/youtube/uploads',headers=h2,json=payload)
     assert forbidden.status_code==404
     not_confirmed=client.post('/api/youtube/uploads',headers=h1,json={**payload,'rights_confirmed':False})
@@ -78,6 +78,15 @@ def test_publish_ownership_validation_and_no_accidental_public(client,monkeypatc
     assert response.json()['privacy']=='private'
     duplicate=client.post('/api/youtube/uploads',headers=h1,json=payload)
     assert duplicate.status_code==409
+    with app_main.connection() as db:
+        db.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',
+                   ('second-export-id', 'project-test', uid1, 'clip-test', str(path), app_main.now()))
+    second = {**payload, 'export_id': 'second-export-id'}
+    assert client.post('/api/youtube/uploads', headers=h1, json=second).status_code == 409
+    yp._update_upload(response.json()['id'], status='failed', error='HTTP 400 uploadLimitExceeded')
+    assert client.post('/api/youtube/uploads', headers=h1, json=second).status_code == 409
+    assert client.post('/api/youtube/uploads', headers=h1,
+                       json={**second, 'studio_retry_confirmed': True}).status_code == 202
     unauthorized=client.get('/api/youtube/uploads/'+response.json()['id'],headers=h2)
     assert unauthorized.status_code==404
 
@@ -120,4 +129,4 @@ def test_live_autopublish_requires_explicit_authorization(client, monkeypatch):
     r=client.post('/api/live',headers=headers,json=payload)
     assert r.status_code==422
     r=client.post('/api/live',headers=headers,json={**payload,'rights_confirmed':True})
-    assert r.status_code==409  # YouTube account isn't connected
+    assert r.status_code==422  # Even authorized live sessions require manual review.

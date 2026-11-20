@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -24,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app import main as m
+from . import chat_signals
 
 router = APIRouter(prefix='/api/live', tags=['Live highlights'])
 STOP = {}
@@ -100,9 +102,9 @@ def downloader_args():
     return args
 
 
-def resolve_sources(url):
+def resolve_sources(url, *, include_video_id=False):
     """Use public/authorized video format URLs; never log them (they can be signed)."""
-    command = downloader_args() + ['-f','bv*[height<=720]+ba/b[height<=720]','--print','%(live_status)s','--get-url',url]
+    command = downloader_args() + ['-f','bv*[height<=720]+ba/b[height<=720]','--print','%(live_status)s','--print','%(id)s','--get-url',url]
     try:
         proc = subprocess.run(command, capture_output=True, text=True, timeout=65)
     except subprocess.TimeoutExpired:
@@ -119,6 +121,10 @@ def resolve_sources(url):
     urls = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith('https://')]
     if not 1 <= len(urls) <= 2:
         raise RuntimeError('Could not find usable live video/audio formats')
+    if include_video_id:
+        video_id = next((line for line in proc.stdout.splitlines()
+                         if re.fullmatch(r'[A-Za-z0-9_-]{11}', line) and line != 'is_live'), None)
+        return urls, video_id
     return urls
 
 
@@ -130,26 +136,29 @@ def record_chunk(urls, output: Path, seconds: int, stop: threading.Event):
     args += ['-map','0:v:0']
     args += ['-map','1:a:0' if len(urls)>1 else '0:a:0?']
     args += ['-t',str(seconds),'-c','copy',str(output)]
-    proc = subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
-    deadline=time.monotonic()+seconds+100
-    try:
-        while proc.poll() is None:
-            if stop.is_set():
-                proc.terminate()
-                try: proc.wait(timeout=8)
-                except subprocess.TimeoutExpired: proc.kill()
-                return False
-            if time.monotonic()>deadline:
+    with tempfile.TemporaryFile() as errors:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors)
+        deadline = time.monotonic() + seconds + 100
+        try:
+            while proc.poll() is None:
+                if stop.wait(.5):
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return False
+                if time.monotonic() > deadline:
+                    raise RuntimeError('Live capture exceeded the expected time window')
+            if proc.returncode:
+                errors.seek(max(0, errors.tell() - 240))
+                detail = errors.read().decode('utf8', errors='replace')
+                raise RuntimeError('FFmpeg live capture failed. ' + re.sub(r'https?://\S+', '[URL]', detail))
+            return True
+        finally:
+            if proc.poll() is None:
                 proc.kill()
-                raise RuntimeError('Live capture exceeded the expected time window')
-            time.sleep(.5)
-        stderr = proc.stderr.read().decode('utf8', errors='replace')[-240:]
-        if proc.returncode:
-            raise RuntimeError('FFmpeg live capture failed. ' + re.sub(r'https?://\S+','[URL]',stderr))
-        return True
-    finally:
-        if proc.poll() is None: proc.kill()
-        if proc.stderr: proc.stderr.close()
+            proc.wait()
 
 
 def ai_candidates(segments, duration):
@@ -177,8 +186,10 @@ def ai_candidates(segments, duration):
         with urllib.request.urlopen(req,timeout=95) as resp:
             data=json.loads(resp.read(100000))
         raw=json.loads(data.get('response','{}'))
-        candidates=raw.get('clips',[])
-        model_ok=isinstance(candidates,list)
+        candidates = raw.get('clips') if isinstance(raw, dict) else None
+        model_ok = isinstance(candidates, list)
+        if not model_ok:
+            candidates = []
     except (ValueError,KeyError,urllib.error.URLError,TimeoutError, OSError):
         candidates=[]
     results=[]
@@ -205,10 +216,22 @@ def ai_candidates(segments, duration):
         ranked = m.rank_clips(segments,duration)
         results = [c for c in ranked if c['end']-c['start']>=30][:3]
         for clip in results: clip['reason']='Transcript-based fallback · '+str(clip.get('reason',''))
-    return results[:3]
+    return select_live_clips(results)
 
 
-def process_recording(session_id, user_id, path, number):
+def select_live_clips(clips):
+    selected = []
+    for clip in sorted(clips, key=lambda item: -item['score']):
+        if all(max(0, min(clip['end'], other['end']) - max(clip['start'], other['start']))
+               < .35 * min(clip['end'] - clip['start'], other['end'] - other['start'])
+               for other in selected):
+            selected.append(clip)
+        if len(selected) == 3:
+            break
+    return selected
+
+
+def process_recording(session_id, user_id, path, number, *, chat_rows=(), recording_epoch=0):
     length,w,h = m.probe(path)
     if length<22: raise RuntimeError('Stream recording too short to analyze')
     pid = m.uid(); ts = m.now()
@@ -220,8 +243,21 @@ def process_recording(session_id, user_id, path, number):
         c.execute("""INSERT INTO projects(id,user_id,title,status,progress,source,source_url,media_path,duration,width,height,transcript,clips,created_at,updated_at)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (pid,user_id,f'Live capture #{number}', 'analyzing',10,'live',None,str(dest),length,w,h,'[]','[]',ts,ts))
-    transcript = m.ensure_transcript(pid,str(dest))
-    clips=ai_candidates(transcript,length)
+    try:
+        transcript = m.ensure_transcript(pid,str(dest))
+        bursts = chat_signals.chat_bursts(
+            '\n'.join(map(json.dumps, chat_rows)), length, recording_epoch,
+        ) if chat_rows else []
+        if bursts:
+            m.update(pid, chat_signals=json.dumps(bursts))
+        clips = ai_candidates(transcript,length)
+        if bursts:
+            ranked = m.rank_clips(transcript, length, bursts=bursts, media_path=dest)
+            clips.extend(clip for clip in ranked if 'Chat burst (' in clip['reason'])
+            clips = select_live_clips(clips)
+    except Exception as exc:
+        m.update(pid,status='failed',progress=0,error=str(exc)[:650])
+        return pid,0
     if not clips:
         m.update(pid,status='ready',progress=100,error=None,clips='[]')
     else:
@@ -233,20 +269,38 @@ def worker(sid,user_id,url,chunk_seconds,auto_export,stop):
     from shutil import rmtree
     folder = m.BASE/'live_chunks'/sid
     folder.mkdir(parents=True,exist_ok=True)
-    with m.connection() as c:
-        live_row=c.execute('SELECT auto_publish,made_for_kids FROM live_sessions WHERE id=?',(sid,)).fetchone()
-    auto_publish=bool(live_row['auto_publish']) if live_row else False
-    made_for_kids=bool(live_row['made_for_kids']) if live_row and live_row['made_for_kids'] is not None else None
-    num=0; failures=0; posted=0
+    num=0; failures=0
+    chat_delay = os.getenv('OPENSHORTS_LIVE_CHAT_CAPTURE_DELAY_SECONDS', '').strip()
+    try:
+        chat_delay = float(chat_delay) if chat_delay else None
+        if chat_delay is not None and not -30 <= chat_delay <= 120:
+            chat_delay = None
+    except ValueError:
+        chat_delay = None
     try:
         while not stop.is_set() and num < 20:
             try:
                 update_session(sid,state='recording',message='Checking stream and recording next live segment')
-                sources=resolve_sources(url)
+                sources, video_id = resolve_sources(url, include_video_id=True)
                 path=folder/f'chunk-{num+1:04d}.mkv'
-                if not record_chunk(sources,path,chunk_seconds,stop): break
+                rows, chat_state = [], {}
+                chat_stop = threading.Event()
+                collector = None
+                recording_epoch = time.time() - (chat_delay or 0)
+                if chat_delay is not None and video_id and os.getenv('OPENSHORTS_YOUTUBE_API_KEY'):
+                    collector = threading.Thread(target=chat_signals.collect_live,
+                                                 args=(video_id, chat_stop, rows, chat_state), daemon=True)
+                    collector.start()
+                try:
+                    recorded = record_chunk(sources,path,chunk_seconds,stop)
+                finally:
+                    chat_stop.set()
+                    if collector:
+                        collector.join(timeout=13)
+                if not recorded:
+                    break
                 update_session(sid,state='analyzing',message=f'Transcribing and finding highlights in capture #{num+1}')
-                pid,count=process_recording(sid,user_id,path,num+1)
+                pid,count=process_recording(sid,user_id,path,num+1,chat_rows=rows[:],recording_epoch=recording_epoch)
                 with m.connection() as c:
                     row=c.execute('SELECT project_ids FROM live_sessions WHERE id=?',(sid,)).fetchone()
                     ids=json.loads(row['project_ids'])
@@ -257,21 +311,7 @@ def worker(sid,user_id,url,chunk_seconds,auto_export,stop):
                         clips=json.loads(c.execute('SELECT clips FROM projects WHERE id=?',(pid,)).fetchone()['clips'])
                     m.update(pid,status='rendering',progress=15)
                     m.render_job(pid,user_id,clips[0],m.uid())
-                    if auto_publish and posted < 3 and not stop.is_set():
-                        from app.youtube_publish import publish_private_auto
-                        with m.connection() as c:
-                            exp=c.execute('SELECT id FROM exports WHERE project_id=? AND user_id=? ORDER BY created_at DESC LIMIT 1',(pid,user_id)).fetchone()
-                        if exp:
-                            try:
-                                result=publish_private_auto(exp['id'],user_id,clips[0]['title'],clips[0].get('description',''),bool(made_for_kids))
-                                if result['status']=='published':
-                                    posted += 1
-                                    update_session(sid,auto_publish_count=posted)
-                                else:
-                                    update_session(sid,message='Auto-upload failed: '+str(result['error'])[:140])
-                            except Exception as ex:
-                                update_session(sid,message='Auto-upload failed: '+str(ex)[:140])
-                update_session(sid,chunks=num,project_ids=json.dumps(ids),message=f'Capture #{num} analyzed · {count} suggested highlights' + (' · Auto-export attempted' if count and auto_export else ''))
+                update_session(sid,chunks=num,project_ids=json.dumps(ids),message=f'Capture #{num} analyzed · {count} suggested highlights' + (' · Auto-export attempted' if count and auto_export else '') + (' · ' + chat_state['message'] if chat_state.get('message') else ''))
             except NotLiveYet:
                 update_session(sid,state='waiting',message='Channel is offline. Checking again in 45 seconds.')
                 if stop.wait(45): break
@@ -306,11 +346,7 @@ class StartLive(BaseModel):
 @router.post('')
 def start_live(data:StartLive,u=Depends(m.current_user)):
     if data.auto_publish:
-        if not data.auto_export or data.made_for_kids is None or not data.rights_confirmed:
-            raise HTTPException(422,'Private auto-publish requires Auto export, audience choice, and confirmed rights')
-        from app.youtube_publish import _oauth_ready, _load_creds
-        if not _oauth_ready() or not _load_creds(u['id']):
-            raise HTTPException(409,'Connect your YouTube account from Account & API before enabling auto-publish')
+        raise HTTPException(422, 'Live clips require manual review and upload from the project editor')
     try: url = validate_url(data.url)
     except ValueError as e: raise HTTPException(422,str(e))
     if not m.transcriber_available():

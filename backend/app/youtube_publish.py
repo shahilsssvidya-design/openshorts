@@ -14,7 +14,7 @@ import re
 import secrets
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -166,8 +166,10 @@ def _error_message(response):
     try:
         data = response.json()
         err = data.get('error', data)
+        codes = ', '.join(str(item.get('reason', '')) for item in err.get('errors', []) if isinstance(item, dict))
         reason = err.get('message') or err.get('error_description') or str(err)
-    except (ValueError, AttributeError):
+        reason = f'{codes}: {reason}' if codes else reason
+    except (ValueError, AttributeError, TypeError):
         reason = response.text[:250]
     return f'YouTube API returned HTTP {response.status_code}: {reason[:280]}'
 
@@ -184,6 +186,8 @@ class PublishRequest(BaseModel):
     privacy: str = 'private'
     made_for_kids: bool
     rights_confirmed: bool
+    clip_reviewed: bool = False
+    studio_retry_confirmed: bool = False
 
 
 @router.get('/status')
@@ -278,7 +282,13 @@ def disconnect(user=Depends(_current_user)):
 @router.get('/exports/{export_id}/upload')
 def latest_upload(export_id: str, user=Depends(_current_user)):
     with _core.connection() as db:
-        row = db.execute('SELECT id FROM yt_uploads WHERE export_id=? AND user_id=? ORDER BY created_at DESC LIMIT 1', (export_id, user['id'])).fetchone()
+        row = db.execute('''
+            SELECT u.id FROM exports requested
+            JOIN exports previous ON previous.project_id=requested.project_id AND previous.clip_id=requested.clip_id
+                                  AND previous.user_id=requested.user_id
+            JOIN yt_uploads u ON u.export_id=previous.id AND u.user_id=previous.user_id
+            WHERE requested.id=? AND requested.user_id=? ORDER BY u.created_at DESC LIMIT 1
+        ''', (export_id, user['id'])).fetchone()
     return _get_upload(row['id'], user['id']) if row else None
 
 
@@ -297,19 +307,33 @@ def start_upload(payload: PublishRequest, tasks: BackgroundTasks, user=Depends(_
         raise HTTPException(422, 'Choose private, unlisted, or public visibility')
     if not payload.rights_confirmed:
         raise HTTPException(422, 'Confirm you have permission to upload this video')
+    if not payload.clip_reviewed:
+        raise HTTPException(422, 'Review the exported clip before uploading')
     title = payload.title.strip()
     if not title:
         raise HTTPException(422, 'A title is required')
     with _core.connection() as db:
-        row = db.execute('SELECT id,path FROM exports WHERE id=? AND user_id=?', (payload.export_id, user['id'])).fetchone()
+        row = db.execute('SELECT id,path,project_id,clip_id FROM exports WHERE id=? AND user_id=?', (payload.export_id, user['id'])).fetchone()
     if not row or not Path(row['path']).is_file():
         raise HTTPException(404, 'Exported MP4 not found. Export the clip first.')
     if not Path(row['path']).resolve().is_relative_to(_core.FILES.resolve()):
         raise HTTPException(403, 'Invalid export path')
     with _core.connection() as db:
-        existing = db.execute('SELECT id,status FROM yt_uploads WHERE export_id=? AND user_id=? AND status IN ("queued","uploading","published")', (payload.export_id, user['id'])).fetchone()
-        if existing:
-            raise HTTPException(409, f'This export already has a YouTube upload ({existing["status"]}). Check its status before trying again.')
+        db.execute('BEGIN IMMEDIATE')
+        existing = db.execute('''
+            SELECT u.status FROM yt_uploads u
+            LEFT JOIN exports e ON e.id=u.export_id AND e.user_id=u.user_id
+            WHERE u.user_id=? AND (u.export_id=? OR (e.project_id=? AND e.clip_id=?))
+        ''', (user['id'], payload.export_id, row['project_id'], row['clip_id'])).fetchall()
+        if any(item['status'] != 'failed' for item in existing):
+            raise HTTPException(409, 'This clip already has a YouTube upload. Check its status.')
+        limit = db.execute(
+            "SELECT 1 FROM yt_uploads WHERE user_id=? AND status='failed' AND updated_at >= ? "
+            "AND (lower(error) LIKE '%uploadlimitexceeded%' OR lower(error) LIKE '%upload limit%')",
+            (user['id'], (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()),
+        ).fetchone()
+        if (existing or limit) and not payload.studio_retry_confirmed:
+            raise HTTPException(409, 'Check YouTube Studio for an existing video and confirm uploads are available before retrying.')
         upload_id = secrets.token_hex(16)
         db.execute('INSERT INTO yt_uploads(id,user_id,export_id,title,description,privacy,made_for_kids,status,progress,video_id,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (upload_id, user['id'], payload.export_id, title, payload.description, payload.privacy, int(payload.made_for_kids), 'queued', 0, None, None, _now(), _now()))
@@ -386,24 +410,3 @@ def _upload_job(upload_id, user_id, path):
     except Exception as ex:
         # Do not auto-retry ambiguous network failures: repeated POSTs may cause duplicate videos.
         _update_upload(upload_id, status='failed', error=(str(ex)[:350] + ' — Check YouTube Studio before retrying to avoid duplicate uploads.'))
-
-
-def publish_private_auto(export_id: str, user_id: str, title: str, description: str, made_for_kids: bool):
-    """Called ONLY after Live Highlights explicitly opts in to private auto-uploads.
-
-    The live route validates rights and audience before starting. This function
-    deliberately never sets public/unlisted visibility; users can review uploads
-    in YouTube Studio before publishing. No ambiguous network auto-retry.
-    """
-    tasks = BackgroundTasks()
-    result = start_upload(
-        PublishRequest(export_id=export_id, title=title[:100] or 'Live highlight',
-                       description=description[:5000], privacy='private',
-                       made_for_kids=made_for_kids, rights_confirmed=True),
-        tasks, {'id': user_id}
-    )
-    with _core.connection() as db:
-        path = db.execute('SELECT path FROM exports WHERE id=? AND user_id=?',
-                          (export_id, user_id)).fetchone()['path']
-    _upload_job(result['id'], user_id, path)
-    return _get_upload(result['id'], user_id)

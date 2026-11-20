@@ -7,11 +7,11 @@ type LiveSession={id:string;url:string;label:string;state:string;message:string;
 const running=(s:LiveSession)=>['starting','waiting','recording','analyzing'].includes(s.state);
 const stateLabel=(s:string)=>({starting:'Connecting',waiting:'Waiting for live',recording:'Capturing livestream',analyzing:'Finding highlights',stopped:'Stopped',failed:'Needs attention'} as Record<string,string>)[s]||s;
 export default function LiveHighlights(){
- const [url,setUrl]=useState('');const [label,setLabel]=useState('My livestream');const [seconds,setSeconds]=useState(120);const [autoExport,setAutoExport]=useState(true);const [autoPublish,setAutoPublish]=useState(false);const [audience,setAudience]=useState('');const [rights,setRights]=useState(false);
+ const [url,setUrl]=useState('');const [label,setLabel]=useState('My livestream');const [seconds,setSeconds]=useState(120);const [autoExport,setAutoExport]=useState(true);
  const [sessions,setSessions]=useState<LiveSession[]>([]);const [loading,setLoading]=useState(true);const [saving,setSaving]=useState(false);const [error,setError]=useState('');
  const refresh=useCallback(async()=>{try{const data=await request<LiveSession[]>('/live');setSessions(data);setError('')}catch(e){setError((e as Error).message)}finally{setLoading(false)}},[]);
  useEffect(()=>{void refresh();const id=setInterval(()=>{void refresh()},4000);return()=>clearInterval(id)},[refresh]);
- async function start(e:React.FormEvent){e.preventDefault();setSaving(true);setError('');try{await post('/live',{url,label,chunk_seconds:seconds,auto_export:autoExport,auto_publish:autoPublish,made_for_kids:autoPublish?(audience==='yes'):null,rights_confirmed:autoPublish&&rights});await refresh()}catch(e){setError((e as Error).message)}finally{setSaving(false)}}
+ async function start(e:React.FormEvent){e.preventDefault();setSaving(true);setError('');try{await post('/live',{url,label,chunk_seconds:seconds,auto_export:autoExport});await refresh()}catch(e){setError((e as Error).message)}finally{setSaving(false)}}
  async function stop(id:string){setSaving(true);try{await post('/live/'+id+'/stop',{});await refresh()}catch(e){setError((e as Error).message)}finally{setSaving(false)}}
  const active=sessions.find(running);
  return <div className="live-container">
@@ -22,8 +22,7 @@ export default function LiveHighlights(){
     <label htmlFor="live-label">Session name</label><input id="live-label" required maxLength={100} value={label} onChange={e=>setLabel(e.target.value)}/>
     <label htmlFor="live-chunk">Analysis window</label><select id="live-chunk" value={seconds} onChange={e=>setSeconds(Number(e.target.value))}><option value={60}>60 seconds · quicker results</option><option value={90}>90 seconds · balanced</option><option value={120}>120 seconds · more context</option></select>
     <label className="live-check"><input checked={autoExport} onChange={e=>setAutoExport(e.target.checked)} type="checkbox"/> Automatically export top-ranked clip from each recording</label>
-    <label className="live-check"><input checked={autoPublish} onChange={e=>setAutoPublish(e.target.checked)} type="checkbox"/> Automatically upload up to 3 completed highlights as <strong>Private</strong> YouTube videos</label>
-    {autoPublish&&<><label htmlFor="yt-live-audience">YouTube audience</label><select id="yt-live-audience" required value={audience} onChange={e=>setAudience(e.target.value)}><option value="">Select audience…</option><option value="no">Not made for kids</option><option value="yes">Made for kids</option></select><label className="live-check"><input type="checkbox" required checked={rights} onChange={e=>setRights(e.target.checked)}/> I own or have permission to republish this livestream and its highlights.</label><p className="hint">Auto-upload is private-only. Review from YouTube Studio. Connect your channel under <a href="/account">Account & API</a> first.</p></>}
+    <p className="hint">Review and upload clips from the project editor.</p>
     <button className="btn btn-primary btn-full" type="submit" disabled={saving||!!active||!url.trim()}>{saving?<LoaderCircle className="spin" size={18}/>:<Play size={17}/>} Start watching <ArrowRight size={16}/></button>
    </form><div className="live-note"><AlertCircle size={16}/> Only track streams you own or have explicit permission to record and repurpose. YouTube may restrict capture or authentication.</div>
   </section>

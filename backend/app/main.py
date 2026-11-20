@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from typing import Optional
 import jwt
+from . import chat_signals
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -42,6 +43,9 @@ def init_db():
         c.executescript('''CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'draft',progress INTEGER DEFAULT 0,error TEXT,source TEXT,source_url TEXT,media_path TEXT,duration REAL DEFAULT 0,width INTEGER DEFAULT 0,height INTEGER DEFAULT 0,transcript TEXT DEFAULT '[]',clips TEXT DEFAULT '[]',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),user_id TEXT NOT NULL REFERENCES users(id),clip_id TEXT NOT NULL,path TEXT NOT NULL,created_at TEXT NOT NULL);''')
+        columns = {row['name'] for row in c.execute('PRAGMA table_info(projects)')}
+        if 'chat_signals' not in columns:
+            c.execute("ALTER TABLE projects ADD COLUMN chat_signals TEXT NOT NULL DEFAULT '[]'")
 init_db()
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -53,6 +57,7 @@ def rowdict(row):
         if k in d:
             try: d[k] = json.loads(d[k] or '[]')
             except Exception: d[k] = []
+    d['chat_bursts'] = len(json.loads(d.pop('chat_signals', '[]')))
     d.pop('media_path', None)
     return d
 
@@ -183,7 +188,7 @@ async def upload(pid:str,file:UploadFile=File(...),u=Depends(current_user)):
     ext=Path(file.filename or '').suffix.lower()
     if ext not in ALLOWED: raise HTTPException(415,'Upload MP4, MOV, MKV, WEBM, M4V or AVI')
     folder=FILES/pid; folder.mkdir(exist_ok=True)
-    dest=folder/('source'+ext)
+    dest=folder/('source-'+uid()+ext)
     size=0
     try:
         with dest.open('wb') as out:
@@ -197,7 +202,7 @@ async def upload(pid:str,file:UploadFile=File(...),u=Depends(current_user)):
         dest.unlink(missing_ok=True)
         if isinstance(e,HTTPException): raise
         raise HTTPException(422,f'Invalid video: {str(e)[:300]}')
-    update(pid,media_path=str(dest),source='upload',source_url=None,duration=duration,width=w,height=h,status='uploaded',progress=0,error=None,clips='[]',transcript='[]')
+    update(pid,media_path=str(dest),source='upload',source_url=None,duration=duration,width=w,height=h,status='uploaded',progress=0,error=None,clips='[]',transcript='[]',chat_signals='[]')
     return rowdict(get_project(pid,u['id']))
 
 YT_PATTERN=re.compile(r'^https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?|shorts/|live/)|youtu\.be/)',re.I)
@@ -211,12 +216,16 @@ def youtube(pid:str,data:URLInput,tasks:BackgroundTasks,u=Depends(current_user))
     return {'status':'importing'}
 def import_youtube(pid,url):
     try:
-        directory=FILES/pid
-        run('yt-dlp','--cookies-from-browser','brave','--js-runtimes','node','--no-playlist','--max-filesize','1G','-f','bv*[height<=1080]+ba/b[height<=1080]/b','--merge-output-format','mp4','-o',str(directory/'source.%(ext)s'),url,timeout=1200)
-        media=next((p for p in directory.glob('source.*') if p.suffix in ALLOWED),None)
+        directory = FILES/pid
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = 'source-' + uid()
+        from .live import downloader_args
+        run(*downloader_args(), '--max-filesize','1G','-f','bv*[height<=1080]+ba/b[height<=1080]/b',
+            '--merge-output-format','mp4','-o',str(directory/(stem+'.%(ext)s')),url,timeout=1200)
+        media = next((p for p in directory.glob(stem + '.*') if p.suffix in ALLOWED), None)
         if not media: raise RuntimeError('No playable video downloaded')
         duration,w,h=probe(media)
-        update(pid,status='uploaded',progress=0,media_path=str(media),duration=duration,width=w,height=h)
+        update(pid,status='uploaded',progress=0,media_path=str(media),duration=duration,width=w,height=h,clips='[]',transcript='[]',chat_signals='[]')
     except Exception as exc: update(pid,status='failed',error=str(exc)[:500],progress=0)
 
 # Human-readable SRT import is useful without a local speech model.
@@ -232,7 +241,7 @@ def parse_srt(raw):
         start,end=map(stamp,matches)
         txt=re.sub('<[^>]+>','', ' '.join(lines[timeline+1:])).strip()
         if txt and end>start: chunks.append({'start':start,'end':end,'text':txt})
-    return chunks
+    return sorted(chunks, key=lambda chunk: chunk['start'])
 @app.post('/api/projects/{pid}/transcript')
 async def transcript_upload(pid:str,file:UploadFile=File(...),u=Depends(current_user)):
     row=get_project(pid,u['id'])
@@ -242,6 +251,31 @@ async def transcript_upload(pid:str,file:UploadFile=File(...),u=Depends(current_
     if not transcript: raise HTTPException(422,'No valid SRT subtitle segments found')
     update(pid,transcript=json.dumps(transcript),status='transcribed',progress=60,error=None)
     return {'segments':len(transcript)}
+
+@app.post('/api/projects/{pid}/chat')
+async def chat_upload(pid: str, file: UploadFile = File(...),
+                      recording_offset: float = Form(0), u=Depends(current_user)):
+    row = get_project(pid, u['id'])
+    if not row['media_path'] or row['status'] in ('importing', 'analyzing', 'rendering'):
+        raise HTTPException(409, 'Add a video and wait for processing to finish')
+    if not math.isfinite(recording_offset) or recording_offset < 0:
+        raise HTTPException(422, 'Recording offset must be a nonnegative number of seconds')
+    raw = await file.read(chat_signals.MAX_LOG_BYTES + 1)
+    if len(raw) > chat_signals.MAX_LOG_BYTES:
+        raise HTTPException(413, 'Chat log exceeds 8 MB')
+    try:
+        signals = chat_signals.chat_bursts(raw.decode('utf-8-sig'), row['duration'], recording_offset)
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError, OverflowError) as exc:
+        raise HTTPException(422, 'Use YouTube replay JSONL or JSONL with id, author_id, text and offset_seconds') from exc
+    with connection() as db:
+        changed = db.execute(
+            "UPDATE projects SET chat_signals=?, updated_at=? WHERE id=? AND updated_at=?",
+            (json.dumps(signals), now(), pid, row['updated_at']),
+        ).rowcount
+    if not changed:
+        raise HTTPException(409, 'Project changed during import. Try importing chat again.')
+    return {'bursts': len(signals)}
+
 
 @app.post('/api/projects/{pid}/analyze')
 def analyze(pid:str,tasks:BackgroundTasks,u=Depends(current_user)):
@@ -282,7 +316,7 @@ def ensure_transcript(pid,path):
     raise RuntimeError('No transcript available. Install faster-whisper (pip install faster-whisper), or upload an SRT transcript in the workspace.')
 
 HOOK_WORDS={'how','why','secret','never','best','mistake','truth','actually','imagine','discover','surprising','important','first','million','easy','learn','warning','stop','powerful','crazy','nobody','biggest','proven'}
-def rank_clips(transcript,duration):
+def rank_clips(transcript,duration, *, bursts=(), media_path=None):
     """Rank complete speech moments, adding setup and keeping natural clip boundaries.
 
     Produces 30-120 second clips where video length permits. No cloud model is
@@ -302,6 +336,9 @@ def rank_clips(transcript,duration):
     candidates = []
     import bisect
     starts = [float(s['start']) for s in segments]
+    ends = []
+    for segment in segments:
+        ends.append(max(ends[-1] if ends else 0, float(segment['end'])))
 
     def bounded_window(core_idx, target):
         """Capture the setup BEFORE a hook and extend through its concluding thought."""
@@ -325,7 +362,8 @@ def rank_clips(transcript,duration):
         minimum_end = min(duration, start + min_needed)
         # Pick an actual transcript boundary closest to desired duration, within 120s.
         possible = []
-        for s in segments[core_idx:]:
+        limit = bisect.bisect_right(starts, start + MAX_LENGTH)
+        for s in segments[core_idx:limit]:
             endpoint = min(float(duration), float(s['end']) + .65)
             if endpoint < minimum_end - .05:
                 continue
@@ -334,7 +372,7 @@ def rank_clips(transcript,duration):
             text = s['text'].rstrip()
             closing = 4 if text.endswith(('.', '!', '?', '।', '॥')) else 0
             possible.append((abs(endpoint - desired_end) - closing, endpoint))
-        end = min(possible, key=lambda t: t[0])[1] if possible else min(duration, start + MAX_LENGTH)
+        end = min(possible, key=lambda t: t[0])[1] if possible else desired_end
         if end - start < min_needed - .05:
             end = min(duration, start + min_needed)
         if end - start > MAX_LENGTH:
@@ -350,7 +388,9 @@ def rank_clips(transcript,duration):
             start, end = bounded_window(i, target)
             if end - start < min(MIN_LENGTH, duration) - .05:
                 continue
-            window = [s for s in segments if float(s['start']) < end and float(s['end']) > start]
+            left = bisect.bisect_right(ends, start)
+            right = bisect.bisect_left(starts, end)
+            window = [s for s in segments[left:right] if float(s['end']) > start]
             if not window:
                 continue
             speech = ' '.join(s['text'].strip() for s in window)
@@ -360,10 +400,17 @@ def rank_clips(transcript,duration):
             hook_words = re.findall(r"\b[\w']+\b", str(seg['text']).lower())
             hook_score = sum(1 for w in hook_words if w in cues)
             density = len(words) / max(1.0, end - start)
-            # Reward speech continuity, expressive punctuation, and segment-local hooks.
+            # Account for long gaps and favor a hook followed by a complete thought.
+            spoken_until = start
+            speech_seconds = 0
+            for segment in window:
+                segment_end = min(end, float(segment['end']))
+                speech_seconds += max(0, segment_end - max(spoken_until, float(segment['start'])))
+                spoken_until = max(spoken_until, segment_end)
+            coverage = speech_seconds / max(.1, end - start)
             score = round(min(99, 35 + min(23, density * 6) + min(22, hook_score * 8)
                               + min(10, speech.count('?') * 3 + speech.count('!') * 2)
-                              + min(9, len(words) / 25)), 1)
+                              + min(9, len(words) / 25) - max(0, .55 - coverage) * 30), 1)
             title_words = str(seg['text']).strip().split()[:10]
             title = (' '.join(title_words).strip(' ,.?!।').capitalize() or 'Highlighted moment')[:78]
             candidates.append({'start': start, 'end': end, 'score': score,
@@ -374,6 +421,8 @@ def rank_clips(transcript,duration):
                                'style': 'bold', 'position': 'bottom', 'color': '#FFFFFF',
                                'caption_scale': 1, 'captions': True})
 
+    if bursts and media_path:
+        chat_signals.boost_candidates(candidates, bursts, media_path)
     candidates.sort(key=lambda c: (-c['score'], c['start']))
     selected = []
     for item in candidates:
@@ -388,15 +437,22 @@ def rank_clips(transcript,duration):
 
 def analyze_job(pid):
     try:
-        with connection() as c: row=c.execute('SELECT media_path,duration FROM projects WHERE id=?',(pid,)).fetchone()
+        with connection() as c: row=c.execute('SELECT media_path,duration,chat_signals,clips FROM projects WHERE id=?',(pid,)).fetchone()
         transcript=ensure_transcript(pid,row['media_path'])
         update(pid,progress=74)
-        from .moment_intelligence import choose_moments
-        clips=choose_moments(transcript,float(row['duration']),fallback_ranker=rank_clips,
-                             progress=lambda value: update(pid,progress=value))
-        for clip in clips:
-            clip['id']=uid()[:12]
+        clips = rank_clips(transcript, float(row['duration']),
+                           bursts=json.loads(row['chat_signals']), media_path=row['media_path'])
         if not clips: raise RuntimeError('No usable speech segments for clips')
+        # Keep the identity of substantially identical suggestions across reanalysis.
+        previous = json.loads(row['clips'])
+        used = set()
+        for clip in clips:
+            for old in previous:
+                overlap = min(clip['end'], old['end']) - max(clip['start'], old['start'])
+                if old['id'] not in used and overlap >= .75 * max(clip['end'] - clip['start'], old['end'] - old['start']):
+                    clip['id'] = old['id']
+                    used.add(old['id'])
+                    break
         update(pid,clips=json.dumps(clips),status='ready',progress=100,error=None)
     except Exception as e: update(pid,status='failed',error=str(e)[:650],progress=0)
 
@@ -436,18 +492,20 @@ def make_ass(pid,clip,transcript):
     alignment={'bottom':2,'middle':5,'top':8}.get(clip.get('position'),2)
     header=f'''[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 2\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,{fontsize},{primary},{secondary},&H00101010&,&H80000000&,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},70,70,230,1\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'''
     def ts(t):
-        t=max(0,t); return f'{int(t//3600)}:{int(t//60)%60:02d}:{int(t)%60:02d}.{int((t%1)*100):02d}'
+        cs = max(0, round(t * 100))
+        return f'{cs//360000}:{cs//6000%60:02d}:{cs//100%60:02d}.{cs%100:02d}'
     mode=clip.get('caption_language','original')
     groups=[]
     for seg in transcript:
         ss=max(start,float(seg['start'])); ee=min(end,float(seg['end']))
         if ee<=ss: continue
-        words=[w for w in seg.get('words',[]) if float(w['end'])>start and float(w['start'])<end]
+        words = seg.get('words') or []
         if not words:
             tokens=seg['text'].split()
             if not tokens: continue
             delta=(float(seg['end'])-float(seg['start']))/len(tokens)
             words=[{'start':float(seg['start'])+i*delta,'end':float(seg['start'])+(i+1)*delta,'text':w} for i,w in enumerate(tokens)]
+        words = [w for w in words if float(w['end']) > start and float(w['start']) < end]
         for j in range(0,len(words),4):
             group=words[j:j+4]
             gs=max(start,float(group[0]['start']))
@@ -467,7 +525,15 @@ def make_ass(pid,clip,transcript):
             base=max(1,total_cs//max(1,len(out_words)))
             kara=''.join('{\\kf'+str(base)+'}'+ass_escape(w.upper())+' ' for w in out_words).strip()
         else:
-            kara=' '.join('{\\kf'+str(max(1,round((float(w['end'])-float(w['start']))*100)))+'}'+ass_escape((romanize(w['text']) if mode=='hinglish' else w['text']).upper()) for w in group)
+            timed_words = []
+            for j, word in enumerate(group):
+                next_start = group[j + 1]['start'] if j + 1 < len(group) else word['end']
+                word_start = max(gs, float(word['start']))
+                word_end = min(ge, float(next_start))
+                centiseconds = max(1, round((word_end - word_start) * 100))
+                text = romanize(word['text']) if mode == 'hinglish' else word['text']
+                timed_words.append('{\\kf' + str(centiseconds) + '}' + ass_escape(text.upper()))
+            kara = ' '.join(timed_words)
         events.append(f'Dialogue: 0,{ts(gs-start)},{ts(ge-start)},Default,,0,0,0,,{kara}')
     path=FILES/pid/(f'{clip["id"]}.ass'); path.write_text(header+'\n'.join(events),encoding='utf-8')
     return path
