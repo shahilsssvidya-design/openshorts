@@ -93,8 +93,17 @@ def choose_moments(transcript,duration,fallback_ranker=None,progress=None,source
     if not proposed:
         return fallback_ranker(valid,duration)[:8] if fallback_ranker is not None else []
     proposed.sort(key=lambda p:p[0],reverse=True)
+    # Spend the expensive visual pass on distinct moments throughout the video.
+    shortlist=[]
+    for candidate in proposed:
+        _,start,end,_=candidate
+        if any(max(0.,min(end,other[2])-max(start,other[1])) >
+               .65*min(end-start,other[2]-other[1]) for other in shortlist):
+            continue
+        shortlist.append(candidate)
+        if len(shortlist)>=24: break
     finalists=[]
-    for i,(_,start,end,speech) in enumerate(proposed[:24]):
+    for i,(_,start,end,speech) in enumerate(shortlist):
         visual=_visual(source,start,end)
         if visual is None:
             score=min(72.,speech['speech_score']*.78)
@@ -116,7 +125,7 @@ def choose_moments(transcript,duration,fallback_ranker=None,progress=None,source
                                     else 'Speech-only candidate; visual check unavailable'),
                           'style':'outline','position':'middle','color':'#FFFFFF',
                           'caption_scale':.9,'captions':True})
-        if progress: progress(min(93,74+int(19*(i+1)/min(24,len(proposed)))))
+        if progress: progress(min(93,74+int(19*(i+1)/len(shortlist))))
     finalists.sort(key=lambda c:(-c['score'],c['start']))
     selected=[]
     for item in finalists:
