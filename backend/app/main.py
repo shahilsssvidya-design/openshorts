@@ -424,7 +424,7 @@ def analyze_job(pid):
         update(pid,progress=74)
         from .moment_intelligence import choose_moments
         clips=choose_moments(transcript,float(row['duration']),fallback_ranker=rank_clips,
-                             progress=lambda value: update(pid,progress=value))
+                             progress=lambda value: update(pid,progress=value),source=row['media_path'])
         with connection() as c:
             project_settings=json.loads(c.execute('SELECT layout_settings FROM projects WHERE id=?',(pid,)).fetchone()['layout_settings'] or '{}')
         checked=checked_layout_settings(project_settings)
