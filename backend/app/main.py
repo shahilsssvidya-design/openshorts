@@ -42,6 +42,10 @@ def init_db():
         c.executescript('''CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'draft',progress INTEGER DEFAULT 0,error TEXT,source TEXT,source_url TEXT,media_path TEXT,duration REAL DEFAULT 0,width INTEGER DEFAULT 0,height INTEGER DEFAULT 0,transcript TEXT DEFAULT '[]',clips TEXT DEFAULT '[]',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),user_id TEXT NOT NULL REFERENCES users(id),clip_id TEXT NOT NULL,path TEXT NOT NULL,created_at TEXT NOT NULL);''')
+    with connection() as c:
+        columns={row['name'] for row in c.execute('PRAGMA table_info(projects)').fetchall()}
+        if 'layout_settings' not in columns:
+            c.execute("ALTER TABLE projects ADD COLUMN layout_settings TEXT NOT NULL DEFAULT '{}'")
 init_db()
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -49,7 +53,7 @@ def uid(): return uuid.uuid4().hex
 def rowdict(row):
     if not row: return None
     d = dict(row)
-    for k in ('transcript','clips'):
+    for k in ('transcript','clips','layout_settings'):
         if k in d:
             try: d[k] = json.loads(d[k] or '[]')
             except Exception: d[k] = []
@@ -120,11 +124,34 @@ class ClipEdit(BaseModel):
     bottom_color_b:str='#4B2F85'
     focus_mode:str='auto'
     caption_language:str='original'
+    facecam_region:str='auto'
+    facecam_x:float=Field(default=0,ge=0,le=1)
+    facecam_y:float=Field(default=0,ge=0,le=1)
+    facecam_w:float=Field(default=0.32,gt=0,le=1)
+    facecam_h:float=Field(default=0.32,gt=0,le=1)
     music_track:str='none'
     music_volume:float=Field(default=0.20,ge=0,le=1)
     original_volume:float=Field(default=1.0,ge=0,le=1)
 class SettingsPayload(BaseModel):
     title:Optional[str]=None
+    layout_settings:Optional[dict]=None
+
+
+def checked_layout_settings(settings: dict) -> dict:
+    """Only accept documented project-level defaults; never persist arbitrary settings."""
+    from .streamer_layout import validate_options
+    mode=settings.get('layout_mode', 'crop')
+    if mode not in ('crop', 'facecam', 'fit', 'split'):
+        raise ValueError('Invalid layout mode')
+    allowed={'layout_mode','facecam_region','facecam_x','facecam_y','facecam_w','facecam_h'}
+    if set(settings)-allowed:
+        raise ValueError('Unknown layout setting')
+    cleaned={'layout_mode':mode,
+             'facecam_region':settings.get('facecam_region', 'auto')}
+    for k, default in [('facecam_x',0),('facecam_y',0),('facecam_w',0.32),('facecam_h',0.32)]:
+        cleaned[k]=float(settings.get(k,default))
+    validate_options(cleaned)
+    return cleaned
 
 @app.get('/api/health')
 def health(): return {'ok':True,'ffmpeg':bool(shutil.which('ffmpeg')),'ffprobe':bool(shutil.which('ffprobe')),'transcription_available':transcriber_available()}
@@ -166,6 +193,10 @@ def patch_project(pid:str,data:SettingsPayload,u=Depends(current_user)):
     if data.title is not None:
         if not data.title.strip(): raise HTTPException(422,'Title cannot be empty')
         update(pid,title=data.title.strip()[:160])
+    if data.layout_settings is not None:
+        try: checked=checked_layout_settings(data.layout_settings)
+        except (ValueError,TypeError,OverflowError) as exc: raise HTTPException(422,str(exc))
+        update(pid,layout_settings=json.dumps(checked))
     return rowdict(get_project(pid,u['id']))
 @app.delete('/api/projects/{pid}')
 def delete_project(pid:str,u=Depends(current_user)):
@@ -393,9 +424,13 @@ def analyze_job(pid):
         update(pid,progress=74)
         from .moment_intelligence import choose_moments
         clips=choose_moments(transcript,float(row['duration']),fallback_ranker=rank_clips,
-                             progress=lambda value: update(pid,progress=value))
+                             progress=lambda value: update(pid,progress=value),source=row['media_path'])
+        with connection() as c:
+            project_settings=json.loads(c.execute('SELECT layout_settings FROM projects WHERE id=?',(pid,)).fetchone()['layout_settings'] or '{}')
+        checked=checked_layout_settings(project_settings)
         for clip in clips:
             clip['id']=uid()[:12]
+            clip.update(checked)
         if not clips: raise RuntimeError('No usable speech segments for clips')
         update(pid,clips=json.dumps(clips),status='ready',progress=100,error=None)
     except Exception as e: update(pid,status='failed',error=str(e)[:650],progress=0)
@@ -413,7 +448,10 @@ def edit_clip(pid:str,clip_id:str,data:ClipEdit,u=Depends(current_user)):
     if data.caption_language not in ('original','hinglish','english'): raise HTTPException(422,'Unknown caption language')
     if not re.fullmatch(r'#[a-fA-F0-9]{6}',data.color): raise HTTPException(422,'Invalid hex color')
     from .fit_layout import validate_style
-    try: validate_style(data.model_dump())
+    try:
+        validate_style(data.model_dump())
+        from .streamer_layout import validate_options
+        validate_options(data.model_dump())
     except ValueError as exc: raise HTTPException(422,str(exc))
     try: os_music.validate_settings(data.music_track, data.music_volume, data.original_volume)
     except ValueError as exc: raise HTTPException(422,str(exc))
@@ -505,6 +543,19 @@ def render_job(pid,user_id,clip,export_id):
         path=Path(row['media_path'])
         if not path.is_file(): raise RuntimeError('Source video is missing')
         start,end=clip['start'],clip['end']
+        if clip.get('layout_mode','crop') == 'facecam':
+            from .streamer_layout import render_facecam
+            update(pid, progress=25)
+            ass=make_ass(pid,clip,json.loads(row['transcript'] or '[]')) if clip.get('captions',True) else None
+            dest=media_extras.title_export_path(pid,clip,export_id)
+            update(pid, progress=45)
+            render_facecam(path,start,end,clip,ass,dest,row['width'],row['height'])
+            os_music.apply_music_to_export(pid,clip,dest)
+            from .output_quality import save_report
+            save_report(dest)
+            with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
+            update(pid,status='ready',progress=100,error=None)
+            return
         if clip.get('layout_mode','crop') == 'split':
             update(pid, progress=25)
             ass=make_ass(pid,clip,json.loads(row['transcript'] or '[]')) if clip.get('captions',True) else None
@@ -512,6 +563,8 @@ def render_job(pid,user_id,clip,export_id):
             update(pid, progress=45)
             media_extras.render_split(path,start,end,clip,ass,dest,pid)
             os_music.apply_music_to_export(pid,clip,dest)
+            from .output_quality import save_report
+            save_report(dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
@@ -523,6 +576,8 @@ def render_job(pid,user_id,clip,export_id):
             update(pid,progress=45)
             render_fit(path,start,end,clip,ass,dest,row['width'],row['height'])
             os_music.apply_music_to_export(pid,clip,dest)
+            from .output_quality import save_report
+            save_report(dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
@@ -539,6 +594,8 @@ def render_job(pid,user_id,clip,export_id):
         run('ffmpeg','-hide_banner','-loglevel','error','-y','-ss',start,'-i',path,'-t',end-start,'-vf',vf,'-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p','-c:a','aac','-b:a','160k','-movflags','+faststart',dest,timeout=1800)
         if not dest.exists() or dest.stat().st_size<1000: raise RuntimeError('MP4 render did not produce a usable file')
         os_music.apply_music_to_export(pid,clip,dest)
+        from .output_quality import save_report
+        save_report(dest)
         with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
         update(pid,status='ready',progress=100,error=None)
     except Exception as exc: update(pid,status='failed',progress=0,error=str(exc)[:650])
@@ -552,7 +609,16 @@ def source(pid:str,u=Depends(current_user)):
 def exports(pid:str,u=Depends(current_user)):
     get_project(pid,u['id'])
     with connection() as c: rows=c.execute('SELECT id,clip_id,created_at FROM exports WHERE project_id=? AND user_id=? ORDER BY created_at DESC',(pid,u['id'])).fetchall()
-    return [dict(r) for r in rows]
+    result=[]
+    for record in rows:
+        entry=dict(record)
+        with connection() as c: stored=c.execute('SELECT path FROM exports WHERE id=? AND user_id=?',(entry['id'],u['id'])).fetchone()
+        report=Path(str(stored['path'])+'.quality.json') if stored else None
+        if report and report.is_file():
+            try: entry['quality']=json.loads(report.read_text(encoding='utf-8'))
+            except (ValueError,OSError): entry['quality']=None
+        result.append(entry)
+    return result
 @app.get('/api/exports/{eid}/download')
 def download(eid:str,u=Depends(current_user)):
     with connection() as c: row=c.execute('SELECT * FROM exports WHERE id=? AND user_id=?',(eid,u['id'])).fetchone()

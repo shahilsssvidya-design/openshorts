@@ -19,8 +19,8 @@ MODES = ('solid', 'gradient', 'blur')
 
 
 def validate_style(clip: dict) -> None:
-    if clip.get('layout_mode', 'crop') not in ('crop', 'fit', 'split'):
-        raise ValueError('Layout must be crop, fit or split')
+    if clip.get('layout_mode', 'crop') not in ('crop', 'fit', 'split', 'facecam'):
+        raise ValueError('Layout must be crop, fit, split or facecam')
     for place in ('top', 'bottom'):
         if clip.get(f'{place}_fill', 'gradient') not in MODES:
             raise ValueError(f'Invalid {place} fill')
