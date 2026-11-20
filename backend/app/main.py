@@ -94,10 +94,19 @@ def run(*args, timeout=600):
     return p.stdout
 
 def probe(path):
-    info=json.loads(run('ffprobe','-v','error','-show_entries','format=duration:stream=codec_type,width,height','-of','json',path,timeout=30))
-    video=next((s for s in info.get('streams',[]) if s.get('codec_type')=='video'),None)
-    if not video: raise ValueError('No video stream detected')
-    return float(info.get('format',{}).get('duration') or 0),int(video.get('width') or 0),int(video.get('height') or 0)
+    info = json.loads(run(
+        'ffprobe', '-v', 'error', '-show_entries',
+        'format=duration:stream=codec_type,width,height:stream_side_data=rotation',
+        '-of', 'json', path, timeout=30,
+    ))
+    video = next((stream for stream in info.get('streams', []) if stream.get('codec_type') == 'video'), None)
+    if not video:
+        raise ValueError('No video stream detected')
+    width, height = int(video.get('width') or 0), int(video.get('height') or 0)
+    rotation = next((item['rotation'] for item in video.get('side_data_list', []) if 'rotation' in item), 0)
+    if int(rotation) % 180 == 90:
+        width, height = height, width
+    return float(info.get('format', {}).get('duration') or 0), width, height
 
 class Auth(BaseModel):
     email:str
@@ -567,7 +576,7 @@ def export(pid:str,clip_id:str,tasks:BackgroundTasks,u=Depends(current_user)):
 def render_job(pid,user_id,clip,export_id):
     from .smart_crop import crop_filter
     try:
-        with connection() as c: row=c.execute('SELECT media_path,transcript,width,height FROM projects WHERE id=?',(pid,)).fetchone()
+        with connection() as c: row=c.execute('SELECT media_path,transcript FROM projects WHERE id=?',(pid,)).fetchone()
         path=Path(row['media_path'])
         if not path.is_file(): raise RuntimeError('Source video is missing')
         start,end=clip['start'],clip['end']
@@ -581,18 +590,18 @@ def render_job(pid,user_id,clip,export_id):
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
+        _, w, h = probe(path)
         if clip.get('layout_mode','crop') == 'fit':
             from .fit_layout import render_fit
             update(pid,progress=25)
             ass=make_ass(pid,clip,json.loads(row['transcript'] or '[]')) if clip.get('captions',True) else None
             dest=media_extras.title_export_path(pid,clip,export_id)
             update(pid,progress=45)
-            render_fit(path,start,end,clip,ass,dest,row['width'],row['height'])
+            render_fit(path,start,end,clip,ass,dest,w,h)
             os_music.apply_music_to_export(pid,clip,dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
-        w,h=row['width'],row['height']
         vf=crop_filter(path,start,end,w,h,clip.get('focus_mode','auto'))
         update(pid,progress=25)
         if clip.get('captions',True):
