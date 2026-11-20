@@ -551,6 +551,8 @@ def render_job(pid,user_id,clip,export_id):
             update(pid, progress=45)
             render_facecam(path,start,end,clip,ass,dest,row['width'],row['height'])
             os_music.apply_music_to_export(pid,clip,dest)
+            from .output_quality import save_report
+            save_report(dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
@@ -561,6 +563,8 @@ def render_job(pid,user_id,clip,export_id):
             update(pid, progress=45)
             media_extras.render_split(path,start,end,clip,ass,dest,pid)
             os_music.apply_music_to_export(pid,clip,dest)
+            from .output_quality import save_report
+            save_report(dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
@@ -572,6 +576,8 @@ def render_job(pid,user_id,clip,export_id):
             update(pid,progress=45)
             render_fit(path,start,end,clip,ass,dest,row['width'],row['height'])
             os_music.apply_music_to_export(pid,clip,dest)
+            from .output_quality import save_report
+            save_report(dest)
             with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
             update(pid,status='ready',progress=100,error=None)
             return
@@ -588,6 +594,8 @@ def render_job(pid,user_id,clip,export_id):
         run('ffmpeg','-hide_banner','-loglevel','error','-y','-ss',start,'-i',path,'-t',end-start,'-vf',vf,'-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p','-c:a','aac','-b:a','160k','-movflags','+faststart',dest,timeout=1800)
         if not dest.exists() or dest.stat().st_size<1000: raise RuntimeError('MP4 render did not produce a usable file')
         os_music.apply_music_to_export(pid,clip,dest)
+        from .output_quality import save_report
+        save_report(dest)
         with connection() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?)',(export_id,pid,user_id,clip['id'],str(dest),now()))
         update(pid,status='ready',progress=100,error=None)
     except Exception as exc: update(pid,status='failed',progress=0,error=str(exc)[:650])
